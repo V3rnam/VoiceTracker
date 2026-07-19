@@ -571,6 +571,49 @@ class VoiceDatabase:
 
             return total
 
+
+    async def set_member_total(
+        self,
+        guild_id: int,
+        user_id: int,
+        total_seconds: int,
+        now: Optional[int] = None,
+    ) -> None:
+        """Remplace manuellement le temps vocal total d'un membre."""
+        assert self.connection is not None
+
+        total_seconds = max(0, int(total_seconds))
+        now = now or int(time.time())
+
+        async with self.lock:
+            await self.connection.execute(
+                """
+                INSERT INTO voice_totals (
+                    guild_id,
+                    user_id,
+                    total_seconds
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    total_seconds = excluded.total_seconds
+                """,
+                (guild_id, user_id, total_seconds),
+            )
+
+            # Si le membre est actuellement en vocal,
+            # sa session repart à partir de maintenant.
+            await self.connection.execute(
+                """
+                UPDATE active_sessions
+                SET started_at = ?
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (now, guild_id, user_id),
+            )
+
+            await self.connection.commit()
+
+
     async def clear_active_sessions(self) -> None:
         assert self.connection is not None
         async with self.lock:
@@ -896,6 +939,93 @@ def render_message(
     except (KeyError, ValueError):
         log.warning("Modèle de message invalide pour le serveur %s", member.guild.id)
         return DEFAULT_MILESTONE_MESSAGE.format_map(values)
+
+
+async def synchronize_member_milestones(
+    guild: discord.Guild,
+    member: discord.Member,
+    total_seconds: int,
+) -> tuple[int, int]:
+    """
+    Synchronise les paliers annoncés et les rôles du membre
+    avec son nouveau temps vocal.
+
+    Retourne :
+        (nombre de rôles ajoutés, nombre de rôles retirés)
+    """
+    milestones = await bot.db.get_milestones(guild.id)
+    configured_roles = await bot.db.get_all_roles(guild.id)
+
+    added_roles = 0
+    removed_roles = 0
+
+    assert bot.db.connection is not None
+
+    # Les paliers déjà atteints sont marqués comme annoncés afin que
+    # le bot ne publie pas immédiatement d'anciennes annonces.
+    async with bot.db.lock:
+        for milestone in milestones:
+            if total_seconds >= milestone.seconds:
+                await bot.db.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO announced_milestones
+                        (guild_id, user_id, milestone, announced_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        guild.id,
+                        member.id,
+                        milestone.number,
+                        int(time.time()),
+                    ),
+                )
+
+        await bot.db.connection.commit()
+
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        return added_roles, removed_roles
+
+    for milestone in milestones:
+        role_id = configured_roles.get(milestone.number)
+        if role_id is None:
+            continue
+
+        role = guild.get_role(role_id)
+        if role is None or role >= me.top_role:
+            continue
+
+        should_have_role = total_seconds >= milestone.seconds
+        has_role = role in member.roles
+
+        try:
+            if should_have_role and not has_role:
+                await member.add_roles(
+                    role,
+                    reason="Modification manuelle du temps vocal",
+                )
+                added_roles += 1
+
+            elif not should_have_role and has_role:
+                await member.remove_roles(
+                    role,
+                    reason="Modification manuelle du temps vocal",
+                )
+                removed_roles += 1
+
+        except discord.Forbidden:
+            log.warning(
+                "Impossible de synchroniser le rôle %s pour le membre %s",
+                role.id,
+                member.id,
+            )
+        except discord.HTTPException:
+            log.exception(
+                "Erreur Discord pendant la synchronisation du rôle %s",
+                role.id,
+            )
+
+    return added_roles, removed_roles
 
 
 async def announce_milestone(
@@ -1755,6 +1885,109 @@ async def reset_all_voice_stats(interaction: discord.Interaction) -> None:
 
 config_group.add_command(reset_group)
 
+@config_group.command(
+    name="temps-modifier",
+    description="Modifier manuellement le temps vocal total d'un membre",
+)
+@app_commands.describe(
+    membre="Membre dont le temps vocal doit être modifié",
+    jours="Nombre de jours à enregistrer",
+    heures="Nombre d'heures supplémentaires",
+    minutes="Nombre de minutes supplémentaires",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def modify_member_voice_time(
+    interaction: discord.Interaction,
+    membre: discord.Member,
+    jours: app_commands.Range[int, 0, 36500] = 0,
+    heures: app_commands.Range[int, 0, 23] = 0,
+    minutes: app_commands.Range[int, 0, 59] = 0,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "❌ Cette commande doit être utilisée dans un serveur.",
+            ephemeral=True,
+        )
+        return
+
+    if membre.bot:
+        await interaction.response.send_message(
+            "❌ Le temps vocal d'un bot ne peut pas être modifié.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+
+    new_total = (
+        int(jours) * DAY
+        + int(heures) * HOUR
+        + int(minutes) * 60
+    )
+
+    old_total = await bot.db.get_total(
+        guild.id,
+        membre.id,
+        include_active=True,
+    )
+
+    await bot.db.set_member_total(
+        guild.id,
+        membre.id,
+        new_total,
+    )
+
+    added_roles, removed_roles = await synchronize_member_milestones(
+        guild,
+        membre,
+        new_total,
+    )
+
+    embed = discord.Embed(
+        title="Temps vocal modifié",
+        colour=discord.Colour.green(),
+    )
+
+    embed.set_thumbnail(url=membre.display_avatar.url)
+
+    embed.add_field(
+        name="Membre",
+        value=membre.mention,
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Ancien temps",
+        value=format_duration(old_total),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Nouveau temps",
+        value=format_duration(new_total),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Rôles synchronisés",
+        value=(
+            f"Ajoutés : **{added_roles}**\n"
+            f"Retirés : **{removed_roles}**"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"Modification effectuée par {interaction.user}"
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+    )
+
 
 bot.tree.add_command(config_group)
 
@@ -1947,8 +2180,25 @@ async def on_app_command_error(
     if isinstance(error, app_commands.MissingPermissions):
         message = "❌ Tu dois avoir la permission « Gérer le serveur »."
     else:
-        log.exception("Erreur de commande", exc_info=error)
-        message = "❌ Une erreur inattendue est survenue."
+        # Les erreurs des commandes sont souvent enveloppées
+        # dans CommandInvokeError.
+        original_error = getattr(error, "original", error)
+
+        log.error(
+            "Erreur pendant la commande /%s : %s",
+            interaction.command.qualified_name if interaction.command else "?",
+            original_error,
+            exc_info=(
+                type(original_error),
+                original_error,
+                original_error.__traceback__,
+            ),
+        )
+
+        message = (
+            "❌ Une erreur est survenue pendant l'exécution de la commande.\n"
+            f"```{type(original_error).__name__}: {original_error}```"
+        )
 
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
