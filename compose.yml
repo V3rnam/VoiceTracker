@@ -1,0 +1,9 @@
+services:
+  voice-milestones:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      DATABASE_PATH: /app/data/voice_milestones.sqlite3
