@@ -174,8 +174,9 @@ class VoiceDatabase:
             CREATE TABLE IF NOT EXISTS milestone_roles (
                 guild_id INTEGER NOT NULL,
                 milestone INTEGER NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('add', 'remove')),
                 role_id INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, milestone)
+                PRIMARY KEY (guild_id, milestone, action)
             );
 
             CREATE TABLE IF NOT EXISTS milestone_times (
@@ -194,6 +195,53 @@ class VoiceDatabase:
             );
             """
         )
+        # Migration des anciennes bases : un ancien rôle associé à un palier
+        # reste un rôle à ajouter. La nouvelle clé permet une action "add"
+        # et une action "remove" simultanées pour le même palier.
+        cursor = await self.connection.execute("PRAGMA table_info(milestone_roles)")
+        role_columns = await cursor.fetchall()
+        has_action = any(str(row[1]) == "action" for row in role_columns)
+        primary_key_columns = [
+            str(row[1])
+            for row in sorted(role_columns, key=lambda row: int(row[5]))
+            if int(row[5]) > 0
+        ]
+
+        if not has_action or primary_key_columns != ["guild_id", "milestone", "action"]:
+            await self.connection.execute(
+                """
+                CREATE TABLE milestone_roles_new (
+                    guild_id INTEGER NOT NULL,
+                    milestone INTEGER NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('add', 'remove')),
+                    role_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, milestone, action)
+                )
+                """
+            )
+            if has_action:
+                await self.connection.execute(
+                    """
+                    INSERT OR REPLACE INTO milestone_roles_new
+                        (guild_id, milestone, action, role_id)
+                    SELECT guild_id, milestone, action, role_id
+                    FROM milestone_roles
+                    """
+                )
+            else:
+                await self.connection.execute(
+                    """
+                    INSERT OR REPLACE INTO milestone_roles_new
+                        (guild_id, milestone, action, role_id)
+                    SELECT guild_id, milestone, 'add', role_id
+                    FROM milestone_roles
+                    """
+                )
+            await self.connection.execute("DROP TABLE milestone_roles")
+            await self.connection.execute(
+                "ALTER TABLE milestone_roles_new RENAME TO milestone_roles"
+            )
+
         await self.connection.commit()
 
     async def close(self) -> None:
@@ -226,60 +274,86 @@ class VoiceDatabase:
                 return None
             return int(row["announcement_channel_id"])
 
-    async def set_role(self, guild_id: int, milestone: int, role_id: int) -> None:
+    async def set_role(
+        self,
+        guild_id: int,
+        milestone: int,
+        action: str,
+        role_id: int,
+    ) -> None:
         assert self.connection is not None
+        if action not in {"add", "remove"}:
+            raise ValueError("Action de rôle invalide.")
+
         async with self.lock:
             await self.connection.execute(
                 """
-                INSERT INTO milestone_roles (guild_id, milestone, role_id)
-                VALUES (?, ?, ?)
-                ON CONFLICT(guild_id, milestone) DO UPDATE SET
+                INSERT INTO milestone_roles (guild_id, milestone, action, role_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, milestone, action) DO UPDATE SET
                     role_id = excluded.role_id
                 """,
-                (guild_id, milestone, role_id),
+                (guild_id, milestone, action, role_id),
             )
             await self.connection.commit()
 
-    async def remove_role(self, guild_id: int, milestone: int) -> None:
+    async def remove_role(
+        self,
+        guild_id: int,
+        milestone: int,
+        action: Optional[str] = None,
+    ) -> None:
         assert self.connection is not None
         async with self.lock:
-            await self.connection.execute(
-                "DELETE FROM milestone_roles WHERE guild_id = ? AND milestone = ?",
-                (guild_id, milestone),
-            )
+            if action is None:
+                await self.connection.execute(
+                    "DELETE FROM milestone_roles WHERE guild_id = ? AND milestone = ?",
+                    (guild_id, milestone),
+                )
+            else:
+                await self.connection.execute(
+                    """
+                    DELETE FROM milestone_roles
+                    WHERE guild_id = ? AND milestone = ? AND action = ?
+                    """,
+                    (guild_id, milestone, action),
+                )
             await self.connection.commit()
 
-    async def get_role(self, guild_id: int, milestone: int) -> Optional[int]:
+    async def get_roles(self, guild_id: int, milestone: int) -> dict[str, int]:
         assert self.connection is not None
         async with self.lock:
             cursor = await self.connection.execute(
                 """
-                SELECT role_id
+                SELECT action, role_id
                 FROM milestone_roles
                 WHERE guild_id = ? AND milestone = ?
                 """,
                 (guild_id, milestone),
             )
-            row = await cursor.fetchone()
-            return int(row["role_id"]) if row else None
+            rows = await cursor.fetchall()
+            return {str(row["action"]): int(row["role_id"]) for row in rows}
 
-    async def get_all_roles(self, guild_id: int) -> dict[int, int]:
+    async def get_all_roles(self, guild_id: int) -> dict[int, dict[str, int]]:
         assert self.connection is not None
         async with self.lock:
             cursor = await self.connection.execute(
                 """
-                SELECT milestone, role_id
+                SELECT milestone, action, role_id
                 FROM milestone_roles
                 WHERE guild_id = ?
-                ORDER BY milestone
+                ORDER BY milestone, action
                 """,
                 (guild_id,),
             )
             rows = await cursor.fetchall()
-            return {
-                int(row["milestone"]): int(row["role_id"])
-                for row in rows
-            }
+
+        result: dict[int, dict[str, int]] = {}
+        for row in rows:
+            result.setdefault(int(row["milestone"]), {})[str(row["action"])] = int(
+                row["role_id"]
+            )
+        return result
 
     async def get_milestones(self, guild_id: int) -> tuple[Milestone, ...]:
         assert self.connection is not None
@@ -880,44 +954,66 @@ class VoiceMilestoneBot(commands.Bot):
 bot = VoiceMilestoneBot()
 
 
-async def assign_milestone_role(
+async def apply_milestone_roles(
     guild: discord.Guild,
     member: discord.Member,
     milestone_number: int,
-) -> tuple[Optional[discord.Role], Optional[str]]:
-    role_id = await bot.db.get_role(guild.id, milestone_number)
-    if role_id is None:
-        return None, None
-
-    role = guild.get_role(role_id)
-    if role is None:
-        return None, "Le rôle configuré n'existe plus."
+) -> tuple[Optional[discord.Role], Optional[discord.Role], list[str]]:
+    """Ajoute et retire les rôles configurés pour un palier."""
+    role_configs = await bot.db.get_roles(guild.id, milestone_number)
+    if not role_configs:
+        return None, None, []
 
     me = guild.me
     if me is None or not me.guild_permissions.manage_roles:
-        return role, "Le bot n'a pas la permission « Gérer les rôles »."
+        return None, None, ["Le bot n'a pas la permission « Gérer les rôles »."]
 
-    if role >= me.top_role:
-        return role, "Le rôle configuré est au-dessus du rôle du bot."
+    added_role: Optional[discord.Role] = None
+    removed_role: Optional[discord.Role] = None
+    errors: list[str] = []
 
-    if role not in member.roles:
+    for action in ("remove", "add"):
+        role_id = role_configs.get(action)
+        if role_id is None:
+            continue
+
+        role = guild.get_role(role_id)
+        action_label = "à ajouter" if action == "add" else "à retirer"
+        if role is None:
+            errors.append(f"Le rôle {action_label} n'existe plus.")
+            continue
+        if role >= me.top_role:
+            errors.append(f"Le rôle {role.mention} est au-dessus du rôle du bot.")
+            continue
+
         try:
-            await member.add_roles(
-                role,
-                reason=f"Palier vocal {milestone_number} atteint",
-            )
+            if action == "remove":
+                removed_role = role
+                if role in member.roles:
+                    await member.remove_roles(
+                        role,
+                        reason=f"Palier vocal {milestone_number} atteint",
+                    )
+            else:
+                added_role = role
+                if role not in member.roles:
+                    await member.add_roles(
+                        role,
+                        reason=f"Palier vocal {milestone_number} atteint",
+                    )
         except discord.Forbidden:
-            return role, "Discord a refusé l'attribution du rôle."
+            operation = "l'attribution" if action == "add" else "le retrait"
+            errors.append(f"Discord a refusé {operation} de {role.mention}.")
         except discord.HTTPException:
             log.exception(
-                "Échec de l'attribution du rôle %s à %s",
+                "Échec de l'action %s sur le rôle %s pour %s",
+                action,
                 role.id,
                 member.id,
             )
-            return role, "Une erreur Discord est survenue pendant l'attribution du rôle."
+            errors.append(f"Erreur Discord pendant la gestion de {role.mention}.")
 
-    return role, None
-
+    return added_role, removed_role, errors
 
 def render_message(
     template: str,
@@ -946,23 +1042,13 @@ async def synchronize_member_milestones(
     member: discord.Member,
     total_seconds: int,
 ) -> tuple[int, int]:
-    """
-    Synchronise les paliers annoncés et les rôles du membre
-    avec son nouveau temps vocal.
-
-    Retourne :
-        (nombre de rôles ajoutés, nombre de rôles retirés)
-    """
+    """Synchronise les rôles du membre avec son temps vocal."""
     milestones = await bot.db.get_milestones(guild.id)
     configured_roles = await bot.db.get_all_roles(guild.id)
-
     added_roles = 0
     removed_roles = 0
 
     assert bot.db.connection is not None
-
-    # Les paliers déjà atteints sont marqués comme annoncés afin que
-    # le bot ne publie pas immédiatement d'anciennes annonces.
     async with bot.db.lock:
         for milestone in milestones:
             if total_seconds >= milestone.seconds:
@@ -972,14 +1058,8 @@ async def synchronize_member_milestones(
                         (guild_id, user_id, milestone, announced_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (
-                        guild.id,
-                        member.id,
-                        milestone.number,
-                        int(time.time()),
-                    ),
+                    (guild.id, member.id, milestone.number, int(time.time())),
                 )
-
         await bot.db.connection.commit()
 
     me = guild.me
@@ -987,43 +1067,30 @@ async def synchronize_member_milestones(
         return added_roles, removed_roles
 
     for milestone in milestones:
-        role_id = configured_roles.get(milestone.number)
-        if role_id is None:
-            continue
+        role_configs = configured_roles.get(milestone.number, {})
+        reached = total_seconds >= milestone.seconds
 
-        role = guild.get_role(role_id)
-        if role is None or role >= me.top_role:
-            continue
+        for action, role_id in role_configs.items():
+            role = guild.get_role(role_id)
+            if role is None or role >= me.top_role:
+                continue
 
-        should_have_role = total_seconds >= milestone.seconds
-        has_role = role in member.roles
-
-        try:
-            if should_have_role and not has_role:
-                await member.add_roles(
-                    role,
-                    reason="Modification manuelle du temps vocal",
-                )
-                added_roles += 1
-
-            elif not should_have_role and has_role:
-                await member.remove_roles(
-                    role,
-                    reason="Modification manuelle du temps vocal",
-                )
-                removed_roles += 1
-
-        except discord.Forbidden:
-            log.warning(
-                "Impossible de synchroniser le rôle %s pour le membre %s",
-                role.id,
-                member.id,
-            )
-        except discord.HTTPException:
-            log.exception(
-                "Erreur Discord pendant la synchronisation du rôle %s",
-                role.id,
-            )
+            has_role = role in member.roles
+            try:
+                if action == "add":
+                    if reached and not has_role:
+                        await member.add_roles(role, reason="Synchronisation du temps vocal")
+                        added_roles += 1
+                    elif not reached and has_role:
+                        await member.remove_roles(role, reason="Synchronisation du temps vocal")
+                        removed_roles += 1
+                elif action == "remove" and reached and has_role:
+                    await member.remove_roles(role, reason="Synchronisation du temps vocal")
+                    removed_roles += 1
+            except discord.Forbidden:
+                log.warning("Impossible de synchroniser le rôle %s", role.id)
+            except discord.HTTPException:
+                log.exception("Erreur Discord pendant la synchronisation du rôle %s", role.id)
 
     return added_roles, removed_roles
 
@@ -1033,8 +1100,9 @@ async def announce_milestone(
     member: discord.Member,
     milestone: Milestone,
     total_seconds: int,
-    assigned_role: Optional[discord.Role],
-    role_error: Optional[str],
+    added_role: Optional[discord.Role],
+    removed_role: Optional[discord.Role],
+    role_errors: list[str],
 ) -> None:
     channel_id = await bot.db.get_announcement_channel(guild.id)
     if channel_id is None:
@@ -1052,16 +1120,23 @@ async def announce_milestone(
         member=member,
         milestone=milestone,
         total_seconds=total_seconds,
-        role=assigned_role,
+        role=added_role or removed_role,
     )
 
-    if assigned_role is not None and role_error is None:
+    if removed_role is not None:
+        description += (
+            "\n\n"
+            f"Le rôle {removed_role.mention} a été retiré au palier "
+            f"**{milestone.number}**."
+        )
+
+    if added_role is not None:
         description += "\n\n" + render_message(
             role_template,
             member=member,
             milestone=milestone,
             total_seconds=total_seconds,
-            role=assigned_role,
+            role=added_role,
         )
 
     embed = discord.Embed(
@@ -1069,14 +1144,11 @@ async def announce_milestone(
         description=description,
         colour=discord.Colour.gold(),
     )
-    embed.add_field(
-        name="Temps comptabilisé",
-        value=format_duration(total_seconds),
-    )
-    if role_error:
+    embed.add_field(name="Temps comptabilisé", value=format_duration(total_seconds))
+    if role_errors:
         embed.add_field(
-            name="Attribution du rôle",
-            value=f"⚠️ {role_error}",
+            name="Gestion des rôles",
+            value="⚠️ " + "\n⚠️ ".join(role_errors),
             inline=False,
         )
     embed.set_thumbnail(url=member.display_avatar.url)
@@ -1084,11 +1156,7 @@ async def announce_milestone(
     try:
         await channel.send(embed=embed)
     except discord.Forbidden:
-        log.warning(
-            "Impossible d'écrire dans le salon %s du serveur %s",
-            channel.id,
-            guild.id,
-        )
+        log.warning("Impossible d'écrire dans le salon %s", channel.id)
     except discord.HTTPException:
         log.exception("Erreur lors de l'annonce du palier")
 
@@ -1104,33 +1172,23 @@ async def process_milestones(
     for milestone in milestones:
         if old_total < milestone.seconds <= new_total:
             first_time = await bot.db.mark_milestone_announced(
-                guild.id,
-                member.id,
-                milestone.number,
+                guild.id, member.id, milestone.number
             )
             if not first_time:
                 continue
 
-            assigned_role, role_error = await assign_milestone_role(
-                guild,
-                member,
-                milestone.number,
+            added_role, removed_role, role_errors = await apply_milestone_roles(
+                guild, member, milestone.number
             )
             await announce_milestone(
-                guild,
-                member,
-                milestone,
-                new_total,
-                assigned_role,
-                role_error,
+                guild, member, milestone, new_total,
+                added_role, removed_role, role_errors,
             )
 
-            if role_error:
+            for role_error in role_errors:
                 log.warning(
-                    "Palier %s de %s atteint, mais rôle non attribué : %s",
-                    milestone.number,
-                    member.id,
-                    role_error,
+                    "Palier %s de %s atteint, mais action de rôle impossible : %s",
+                    milestone.number, member.id, role_error,
                 )
 
 
@@ -1138,11 +1196,15 @@ async def remove_milestone_roles(
     guild: discord.Guild,
     member: discord.Member,
 ) -> tuple[int, int]:
-    """Retire les rôles associés aux paliers. Retourne (retirés, erreurs)."""
+    """Retire uniquement les rôles configurés avec l'action add."""
     configured_roles = await bot.db.get_all_roles(guild.id)
+    role_ids = {
+        actions["add"]
+        for actions in configured_roles.values()
+        if "add" in actions
+    }
     roles_to_remove = [
-        role
-        for role_id in configured_roles.values()
+        role for role_id in role_ids
         if (role := guild.get_role(role_id)) is not None and role in member.roles
     ]
 
@@ -1151,26 +1213,18 @@ async def remove_milestone_roles(
 
     me = guild.me
     removable_roles = [
-        role
-        for role in roles_to_remove
-        if me is not None
-        and me.guild_permissions.manage_roles
-        and role < me.top_role
+        role for role in roles_to_remove
+        if me is not None and me.guild_permissions.manage_roles and role < me.top_role
     ]
     errors = len(roles_to_remove) - len(removable_roles)
 
     if removable_roles:
         try:
             await member.remove_roles(
-                *removable_roles,
-                reason="Réinitialisation des statistiques vocales",
+                *removable_roles, reason="Réinitialisation des statistiques vocales"
             )
         except (discord.Forbidden, discord.HTTPException):
-            log.exception(
-                "Impossible de retirer les rôles de paliers de %s sur %s",
-                member.id,
-                guild.id,
-            )
+            log.exception("Impossible de retirer les rôles de paliers de %s", member.id)
             return 0, len(roles_to_remove)
 
     return len(removable_roles), errors
@@ -1625,64 +1679,107 @@ async def reset_config_message(
 
 @config_group.command(
     name="role-associer",
-    description="Associer un rôle à un palier vocal",
+    description="Ajouter et/ou retirer un rôle lorsqu'un palier est atteint",
 )
 @app_commands.describe(
     palier="Numéro du palier, entre 1 et 20",
-    role="Rôle attribué lorsqu'un membre atteint ce palier",
+    role_ajouter="Rôle à attribuer lorsque le palier est atteint",
+    role_retirer="Rôle à retirer lorsque le palier est atteint",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def config_role(
     interaction: discord.Interaction,
     palier: app_commands.Range[int, 1, 20],
-    role: discord.Role,
+    role_ajouter: Optional[discord.Role] = None,
+    role_retirer: Optional[discord.Role] = None,
 ) -> None:
     assert interaction.guild is not None
-    me = interaction.guild.me
+    guild = interaction.guild
+    me = guild.me
 
-    if role.is_default():
+    if role_ajouter is None and role_retirer is None:
         await interaction.response.send_message(
-            "❌ Le rôle `@everyone` ne peut pas être attribué.",
+            "❌ Indique au moins un rôle à ajouter ou à retirer.",
             ephemeral=True,
         )
         return
 
-    if me is None or role >= me.top_role:
-        await interaction.response.send_message(
-            "❌ Place le rôle du bot au-dessus de ce rôle dans les paramètres Discord.",
-            ephemeral=True,
-        )
-        return
+    if role_ajouter is not None and role_retirer is not None:
+        if role_ajouter.id == role_retirer.id:
+            await interaction.response.send_message(
+                "❌ Le même rôle ne peut pas être ajouté et retiré au même palier.",
+                ephemeral=True,
+            )
+            return
+
+    for role in (role_ajouter, role_retirer):
+        if role is None:
+            continue
+        if role.is_default():
+            await interaction.response.send_message(
+                "❌ Le rôle `@everyone` ne peut pas être utilisé.",
+                ephemeral=True,
+            )
+            return
+        if me is None or role >= me.top_role:
+            await interaction.response.send_message(
+                f"❌ Place le rôle du bot au-dessus de {role.mention} dans Discord.",
+                ephemeral=True,
+            )
+            return
 
     milestone_number = int(palier)
-    await bot.db.set_role(interaction.guild.id, milestone_number, role.id)
+    if role_ajouter is not None:
+        await bot.db.set_role(
+            guild.id, milestone_number, "add", role_ajouter.id
+        )
+    if role_retirer is not None:
+        await bot.db.set_role(
+            guild.id, milestone_number, "remove", role_retirer.id
+        )
 
-    milestones = await bot.db.get_milestones(interaction.guild.id)
+    milestones = await bot.db.get_milestones(guild.id)
     milestone = next(m for m in milestones if m.number == milestone_number)
+    actions: list[str] = []
+    if role_retirer is not None:
+        actions.append(f"retirer {role_retirer.mention}")
+    if role_ajouter is not None:
+        actions.append(f"ajouter {role_ajouter.mention}")
 
     await interaction.response.send_message(
-        f"✅ {role.mention} sera attribué au palier **{milestone_number}** "
-        f"(**{milestone.label}**).",
+        f"✅ Au palier **{milestone_number}** (**{milestone.label}**), "
+        + " et ".join(actions)
+        + ".",
         ephemeral=True,
     )
 
 
 @config_group.command(
     name="role-retirer",
-    description="Supprimer l'association entre un rôle et un palier",
+    description="Supprimer une ou toutes les actions de rôle d'un palier",
 )
 @app_commands.describe(
     palier="Numéro du palier, entre 1 et 20",
+    action="Action à supprimer",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Rôle à ajouter", value="add"),
+        app_commands.Choice(name="Rôle à retirer", value="remove"),
+        app_commands.Choice(name="Toutes les actions", value="all"),
+    ]
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def remove_config_role(
     interaction: discord.Interaction,
     palier: app_commands.Range[int, 1, 20],
+    action: app_commands.Choice[str],
 ) -> None:
     assert interaction.guild is not None
-    await bot.db.remove_role(interaction.guild.id, int(palier))
+    selected_action = None if action.value == "all" else action.value
+    await bot.db.remove_role(interaction.guild.id, int(palier), selected_action)
     await interaction.response.send_message(
-        f"✅ Aucun rôle ne sera désormais attribué au palier **{palier}**.",
+        f"✅ Configuration « {action.name} » supprimée pour le palier **{palier}**.",
         ephemeral=True,
     )
 
@@ -1763,12 +1860,24 @@ async def show_config(interaction: discord.Interaction) -> None:
     else:
         milestone_by_number = {m.number: m for m in milestones}
         role_lines: list[str] = []
-        for milestone_number, role_id in roles.items():
-            role = guild.get_role(role_id)
+        for milestone_number, actions in roles.items():
             milestone = milestone_by_number[milestone_number]
+            details: list[str] = []
+            remove_id = actions.get("remove")
+            add_id = actions.get("add")
+            if remove_id is not None:
+                role = guild.get_role(remove_id)
+                details.append(
+                    f"retirer {role.mention if role else '`rôle supprimé`'}"
+                )
+            if add_id is not None:
+                role = guild.get_role(add_id)
+                details.append(
+                    f"ajouter {role.mention if role else '`rôle supprimé`'}"
+                )
             role_lines.append(
                 f"**{milestone_number}.** {milestone.label} → "
-                f"{role.mention if role else '`rôle supprimé`'}"
+                + " puis ".join(details)
             )
         role_text = "\n".join(role_lines)
 
@@ -1778,7 +1887,7 @@ async def show_config(interaction: discord.Interaction) -> None:
 
 @config_group.command(
     name="roles-synchroniser",
-    description="Attribuer les rôles déjà mérités aux membres connus",
+    description="Synchroniser les rôles avec les paliers déjà atteints",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def sync_roles(interaction: discord.Interaction) -> None:
@@ -1786,11 +1895,7 @@ async def sync_roles(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     guild = interaction.guild
-    configured_roles = await bot.db.get_all_roles(guild.id)
-    milestones = await bot.db.get_milestones(guild.id)
-    milestone_by_number = {m.number: m for m in milestones}
-
-    assignments = 0
+    actions_done = 0
     errors = 0
 
     for user_id, _stored_total in await bot.db.all_totals(guild.id):
@@ -1798,26 +1903,14 @@ async def sync_roles(interaction: discord.Interaction) -> None:
         if member is None or member.bot:
             continue
 
+        before_roles = {role.id for role in member.roles}
         total = await bot.db.get_total(guild.id, user_id)
-        for milestone_number in configured_roles:
-            milestone = milestone_by_number[milestone_number]
-            if total < milestone.seconds:
-                continue
-
-            role_id = configured_roles[milestone_number]
-            role = guild.get_role(role_id)
-            already_has_role = role is not None and role in member.roles
-            _assigned_role, error = await assign_milestone_role(
-                guild, member, milestone_number
-            )
-
-            if error:
-                errors += 1
-            elif not already_has_role:
-                assignments += 1
+        await synchronize_member_milestones(guild, member, total)
+        after_roles = {role.id for role in member.roles}
+        actions_done += len(before_roles.symmetric_difference(after_roles))
 
     await interaction.followup.send(
-        f"✅ Synchronisation terminée : **{assignments}** attribution(s), "
+        f"✅ Synchronisation terminée : **{actions_done}** action(s) de rôle, "
         f"**{errors}** erreur(s).",
         ephemeral=True,
     )
